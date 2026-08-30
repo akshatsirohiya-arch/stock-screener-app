@@ -31,45 +31,35 @@ def clean_and_filter_tickers(raw_tickers):
     return list(set(clean_tickers))
 
 def fetch_full_us_ticker_universe():
-    """
-    Combines SEC EDGAR + NASDAQ Trader Directory to fetch every active 
-    common stock and foreign ADR traded across NYSE, NASDAQ, and AMEX.
-    """
+    """Combines SEC EDGAR + NASDAQ Trader Directory to fetch common stocks and ADRs."""
     tickers = set()
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     }
 
     # Source 1: SEC EDGAR Submissions Directory
     try:
-        print("Fetching US domestic filings from SEC EDGAR...")
         sec_url = "https://files.sec.gov/submissions/company_tickers.json"
         resp = requests.get(sec_url, headers={'User-Agent': 'StockScreenerApp admin@example.com'}, timeout=15)
         if resp.status_code == 200:
             df_sec = pd.DataFrame.from_dict(resp.json(), orient='index')
             tickers.update(df_sec['ticker'].tolist())
-            print(f"Loaded {len(df_sec)} tickers from SEC EDGAR.")
     except Exception as e:
         print(f"SEC EDGAR fetch notice: {e}")
 
-    # Source 2: NASDAQ Trader Master Exchange Directory (Contains all NYSE/NASDAQ/AMEX ADRs & Stocks)
+    # Source 2: NASDAQ Trader Master Exchange Directory
     try:
-        print("Fetching foreign ADRs and exchange listings from NASDAQ Trader Directory...")
         nasdaq_url = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqtraded.txt"
         resp = requests.get(nasdaq_url, headers=headers, timeout=15)
         if resp.status_code == 200:
             df_nasdaq = pd.read_csv(io.StringIO(resp.text), sep='|')
-            # Filter out test issues
             df_nasdaq = df_nasdaq[df_nasdaq['Test Issue'] == 'N']
-            nasdaq_symbols = df_nasdaq['Symbol'].dropna().tolist()
-            tickers.update(nasdaq_symbols)
-            print(f"Loaded exchange-traded universe from NASDAQ directory.")
+            tickers.update(df_nasdaq['Symbol'].dropna().tolist())
     except Exception as e:
         print(f"NASDAQ directory fetch notice: {e}")
 
-    # Apply strict cleaning & deduplication
     valid_tickers = clean_and_filter_tickers(list(tickers))
-    print(f"Combined master universe contains {len(valid_tickers)} clean equities & ADRs.")
+    print(f"Master universe contains {len(valid_tickers)} clean equities & ADRs.")
     return valid_tickers
 
 def process_batch(ticker_batch):
@@ -89,11 +79,10 @@ def process_batch(ticker_batch):
                 info = stock_obj.info
                 market_cap = info.get("marketCap", 0)
                 
-                # EXTENDED MID-CAP & ADR FILTER: $1 Billion to $25 Billion
+                # Extended Mid-Cap & ADR Filter: $1 Billion to $25 Billion
                 if not (1e9 <= market_cap <= 25e9):
                     continue
                 
-                # Retrieve 1-year historical price data
                 hist = stock_obj.history(period="1y")
                 if hist.empty or len(hist) < 90:
                     continue
@@ -107,7 +96,10 @@ def process_batch(ticker_batch):
                 low_90 = last_90['Low'].min()
                 range_pct = (high_90 - low_90) / low_90 if low_90 else 0
                 dist_from_high = (high_90 - price) / high_90 if high_90 else 0
+                
+                # Breakout Conditions
                 near_breakout = "YES" if dist_from_high <= 0.05 else "NO"
+                tight_range = "YES" if range_pct <= 0.25 else "NO"  # Tight 90D spread <= 25%
                 
                 # Volume & Moving Average Metrics
                 curr_vol = hist['Volume'].iloc[-1]
@@ -117,10 +109,11 @@ def process_batch(ticker_batch):
                 ma_150 = hist['Close'].tail(150).mean() if len(hist) >= 150 else price
                 higher_150d = "YES" if price > ma_150 else "NO"
                 
-                # Composite Breakout Score (0 to 3)
+                # Composite Breakout Score (0 to 4 Points)
                 score = (1 if near_breakout == "YES" else 0) + \
                         (1 if vol_spike == "YES" else 0) + \
-                        (1 if higher_150d == "YES" else 0)
+                        (1 if higher_150d == "YES" else 0) + \
+                        (1 if tight_range == "YES" else 0)
                 
                 # 52-Week High & Day Return
                 high_52 = hist['High'].max()
@@ -133,6 +126,7 @@ def process_batch(ticker_batch):
                     "Day Return (%)": round(day_return * 100, 2),
                     "Breakout Score": score,
                     "Near Breakout": near_breakout,
+                    "Tight Range": tight_range,
                     "Volume Spike": vol_spike,
                     "Higher than 150D": higher_150d,
                     "90% of 52W High": is_90_pct_high,
@@ -158,7 +152,7 @@ def main():
     batch_size = 50
     all_midcap_records = []
     
-    print(f"Scanning master market universe across {len(all_tickers)} tickers for Extended Mid-Caps & ADRs ($1B-$25B)...")
+    print(f"Scanning market universe across {len(all_tickers)} tickers for Extended Mid-Caps & ADRs ($1B-$25B)...")
     
     for i in range(0, len(all_tickers), batch_size):
         batch = all_tickers[i:i + batch_size]
@@ -173,7 +167,7 @@ def main():
     df = pd.DataFrame(all_midcap_records)
     if not df.empty:
         df.to_parquet("latest_stocks.parquet")
-        print(f"\n✅ FULL SCAN COMPLETE: {len(df)} verified mid-caps & ADRs ($1B-$25B) saved to latest_stocks.parquet.")
+        print(f"\n✅ SCAN COMPLETE: {len(df)} verified mid-caps & ADRs ($1B-$25B) saved to latest_stocks.parquet.")
     else:
         print("❌ Error: No valid mid-cap records found.")
 
