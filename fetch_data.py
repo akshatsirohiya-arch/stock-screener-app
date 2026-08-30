@@ -1,19 +1,40 @@
 import io
-import json
+import re
 import time
 import datetime
 import requests
 import pandas as pd
 import yfinance as yf
 
+def clean_and_filter_tickers(raw_tickers):
+    """Cleans ticker symbols and keeps common stocks & foreign ADRs while dropping derivatives/preferreds."""
+    clean_tickers = []
+    
+    for t in raw_tickers:
+        ticker = str(t).strip().upper()
+        
+        # 1. Skip Warrants (-W, -WT), Units (-U, -UN), Rights (-R)
+        if re.search(r'[-.](W|WT|U|UN|R|WS)$', ticker):
+            continue
+            
+        # 2. Skip Preferred Shares ($ or -PR or .PR)
+        if '$' in ticker or '-PR' in ticker or '.PR' in ticker:
+            continue
+            
+        # 3. Format Class Shares & ADRs for Yahoo Finance (e.g., BRK.B -> BRK-B)
+        ticker = ticker.replace('.', '-')
+        
+        # Keep valid alphanumeric tickers (includes standard stocks, dual classes & foreign ADRs)
+        if ticker.replace('-', '').isalnum():
+            clean_tickers.append(ticker)
+            
+    return list(set(clean_tickers))
+
 def fetch_full_us_ticker_universe():
-    """
-    Fetches the complete directory of US-listed stock tickers directly from SEC EDGAR.
-    Covers NYSE, NASDAQ, and AMEX without relying on static index subsets.
-    """
+    """Fetches full US stock directory directly from SEC EDGAR."""
     print("Fetching complete US stock directory from SEC EDGAR...")
     headers = {
-        'User-Agent': 'StockScreenerApp user@example.com'  # SEC requires a user-agent header
+        'User-Agent': 'StockScreenerApp admin@example.com'
     }
     sec_url = "https://files.sec.gov/submissions/company_tickers.json"
     
@@ -22,41 +43,23 @@ def fetch_full_us_ticker_universe():
         resp.raise_for_status()
         sec_data = resp.json()
         
-        # Convert SEC JSON to DataFrame
         df_sec = pd.DataFrame.from_dict(sec_data, orient='index')
+        raw_tickers = df_sec['ticker'].tolist()
         
-        # Extract tickers & clean for yfinance compatibility (replace '.' with '-')
-        raw_tickers = df_sec['ticker'].astype(str).str.strip().tolist()
-        clean_tickers = [
-            t.replace('.', '-') for t in raw_tickers 
-            if t.isalpha() or '-' in t or '.' in t
-        ]
-        
-        # Remove common warrants/units/preferred share suffixes
-        filtered_tickers = list(set([
-            t for t in clean_tickers 
-            if not any(t.endswith(suffix) for suffix in ['W', 'WS', 'U', 'R', 'P'])
-        ]))
-        
-        print(f"Successfully retrieved {len(filtered_tickers)} total US listed entities.")
-        return filtered_tickers
+        valid_tickers = clean_and_filter_tickers(raw_tickers)
+        print(f"Retrieved {len(valid_tickers)} clean tickers for universe screening.")
+        return valid_tickers
         
     except Exception as e:
-        print(f"Primary SEC fetch failed: {e}. Falling back to NASDAQ directory...")
-        nasdaq_url = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqtraded.txt"
-        resp = requests.get(nasdaq_url, headers=headers, timeout=15)
-        df_nasdaq = pd.read_csv(io.StringIO(resp.text), sep='|')
-        df_nasdaq = df_nasdaq[df_nasdaq['Test Issue'] == 'N']
-        tickers = df_nasdaq['Symbol'].astype(str).str.replace('.', '-', regex=False).tolist()
-        return tickers
+        print(f"Primary SEC fetch failed ({e}). Falling back to default list...")
+        return ["TWLO", "ILMN", "FTI", "ATI", "OKTA", "NVT", "CRS", "ENTG", "RGLD", "WWD", "ROKU"]
 
 def process_batch(ticker_batch):
-    """Fetches history and info for a batch of tickers and calculates technical metrics."""
+    """Fetches data and screens for Extended Mid-Caps and ADRs ($1B - $25B)."""
     records = []
+    tickers_str = " ".join(ticker_batch)
     
-    # Download 1-year history in bulk for the batch to maximize performance
     try:
-        tickers_str = " ".join(ticker_batch)
         data = yf.Tickers(tickers_str)
         
         for ticker_symbol in ticker_batch:
@@ -65,15 +68,14 @@ def process_batch(ticker_batch):
                 if not stock_obj:
                     continue
                 
-                # Retrieve info & market cap
                 info = stock_obj.info
                 market_cap = info.get("marketCap", 0)
                 
-                # STRICT MID-CAP FILTER: $2 Billion to $15 Billion
-                if not (2e9 <= market_cap <= 15e9):
+                # EXTENDED MID-CAP & ADR FILTER: $1 Billion to $25 Billion
+                if not (1e9 <= market_cap <= 25e9):
                     continue
                 
-                # Price history check
+                # Fetch 1-year history
                 hist = stock_obj.history(period="1y")
                 if hist.empty or len(hist) < 90:
                     continue
@@ -81,7 +83,7 @@ def process_batch(ticker_batch):
                 price = hist['Close'].iloc[-1]
                 prev_close = hist['Close'].iloc[-2] if len(hist) > 1 else price
                 
-                # 90-Day High / Low Metrics (Data Sheet)
+                # 90-Day High / Low Metrics
                 last_90 = hist.tail(90)
                 high_90 = last_90['High'].max()
                 low_90 = last_90['Low'].min()
@@ -97,12 +99,12 @@ def process_batch(ticker_batch):
                 ma_150 = hist['Close'].tail(150).mean() if len(hist) >= 150 else price
                 higher_150d = "YES" if price > ma_150 else "NO"
                 
-                # Composite Breakout Score (0 to 3)
+                # Breakout Composite Score (0 to 3)
                 score = (1 if near_breakout == "YES" else 0) + \
                         (1 if vol_spike == "YES" else 0) + \
                         (1 if higher_150d == "YES" else 0)
                 
-                # 52-Week High / Low & Master Sheet Metrics
+                # 52-Week High & Day Return
                 high_52 = hist['High'].max()
                 is_90_pct_high = "Yes" if (high_52 and price >= 0.90 * high_52) else "No"
                 day_return = (price - prev_close) / prev_close if prev_close else 0
@@ -128,9 +130,8 @@ def process_batch(ticker_batch):
                 })
             except Exception:
                 continue
-                
     except Exception as e:
-        print(f"Error processing batch: {e}")
+        print(f"Batch processing error: {e}")
         
     return records
 
@@ -139,7 +140,7 @@ def main():
     batch_size = 50
     all_midcap_records = []
     
-    print(f"Starting universe scan across {len(all_tickers)} US securities in batches of {batch_size}...")
+    print(f"Scanning market universe across {len(all_tickers)} tickers for Extended Mid-Caps & ADRs ($1B-$25B)...")
     
     for i in range(0, len(all_tickers), batch_size):
         batch = all_tickers[i:i + batch_size]
@@ -147,15 +148,14 @@ def main():
         all_midcap_records.extend(records)
         
         if (i // batch_size + 1) % 10 == 0 or (i + batch_size) >= len(all_tickers):
-            print(f"Scanned {min(i + batch_size, len(all_tickers))}/{len(all_tickers)} tickers | Identified Mid-Caps ($2B-$15B): {len(all_midcap_records)}")
+            print(f"Scanned {min(i + batch_size, len(all_tickers))}/{len(all_tickers)} tickers | Verified Mid-Caps/ADRs: {len(all_midcap_records)}")
         
-        # Friendly rate limiting for Yahoo Finance
         time.sleep(0.5)
         
     df = pd.DataFrame(all_midcap_records)
     if not df.empty:
         df.to_parquet("latest_stocks.parquet")
-        print(f"\n✅ FULL SCAN COMPLETE: {len(df)} verified US Mid-Cap ($2B-$15B) stocks saved to latest_stocks.parquet.")
+        print(f"\n✅ EXTENDED SCAN COMPLETE: {len(df)} verified mid-cap & ADR stocks ($1B-$25B) saved to latest_stocks.parquet.")
     else:
         print("❌ Error: No valid mid-cap records found.")
 
