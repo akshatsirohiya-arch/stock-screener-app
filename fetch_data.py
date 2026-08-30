@@ -7,55 +7,73 @@ import pandas as pd
 import yfinance as yf
 
 def clean_and_filter_tickers(raw_tickers):
-    """Cleans ticker symbols and keeps common stocks & foreign ADRs while dropping derivatives/preferreds."""
+    """Cleans raw ticker symbols while explicitly preserving foreign ADRs and common equities."""
     clean_tickers = []
     
     for t in raw_tickers:
         ticker = str(t).strip().upper()
         
-        # 1. Skip Warrants (-W, -WT), Units (-U, -UN), Rights (-R)
+        # 1. Exclude Warrants (-W, -WT), Units (-U, -UN), Rights (-R)
         if re.search(r'[-.](W|WT|U|UN|R|WS)$', ticker):
             continue
             
-        # 2. Skip Preferred Shares ($ or -PR or .PR)
+        # 2. Exclude Preferred Stock ($ or -PR or .PR)
         if '$' in ticker or '-PR' in ticker or '.PR' in ticker:
             continue
             
-        # 3. Format Class Shares & ADRs for Yahoo Finance (e.g., BRK.B -> BRK-B)
+        # 3. Reformat Class Shares & ADRs for Yahoo Finance (e.g., BRK.B -> BRK-B)
         ticker = ticker.replace('.', '-')
         
-        # Keep valid alphanumeric tickers (includes standard stocks, dual classes & foreign ADRs)
+        # Preserve standard tickers, dual classes, and international ADRs
         if ticker.replace('-', '').isalnum():
             clean_tickers.append(ticker)
             
     return list(set(clean_tickers))
 
 def fetch_full_us_ticker_universe():
-    """Fetches full US stock directory directly from SEC EDGAR."""
-    print("Fetching complete US stock directory from SEC EDGAR...")
+    """
+    Combines SEC EDGAR + NASDAQ Trader Directory to fetch every active 
+    common stock and foreign ADR traded across NYSE, NASDAQ, and AMEX.
+    """
+    tickers = set()
     headers = {
-        'User-Agent': 'StockScreenerApp admin@example.com'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
-    sec_url = "https://files.sec.gov/submissions/company_tickers.json"
-    
+
+    # Source 1: SEC EDGAR Submissions Directory
     try:
-        resp = requests.get(sec_url, headers=headers, timeout=15)
-        resp.raise_for_status()
-        sec_data = resp.json()
-        
-        df_sec = pd.DataFrame.from_dict(sec_data, orient='index')
-        raw_tickers = df_sec['ticker'].tolist()
-        
-        valid_tickers = clean_and_filter_tickers(raw_tickers)
-        print(f"Retrieved {len(valid_tickers)} clean tickers for universe screening.")
-        return valid_tickers
-        
+        print("Fetching US domestic filings from SEC EDGAR...")
+        sec_url = "https://files.sec.gov/submissions/company_tickers.json"
+        resp = requests.get(sec_url, headers={'User-Agent': 'StockScreenerApp admin@example.com'}, timeout=15)
+        if resp.status_code == 200:
+            df_sec = pd.DataFrame.from_dict(resp.json(), orient='index')
+            tickers.update(df_sec['ticker'].tolist())
+            print(f"Loaded {len(df_sec)} tickers from SEC EDGAR.")
     except Exception as e:
-        print(f"Primary SEC fetch failed ({e}). Falling back to default list...")
-        return ["TWLO", "ILMN", "FTI", "ATI", "OKTA", "NVT", "CRS", "ENTG", "RGLD", "WWD", "ROKU"]
+        print(f"SEC EDGAR fetch notice: {e}")
+
+    # Source 2: NASDAQ Trader Master Exchange Directory (Contains all NYSE/NASDAQ/AMEX ADRs & Stocks)
+    try:
+        print("Fetching foreign ADRs and exchange listings from NASDAQ Trader Directory...")
+        nasdaq_url = "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqtraded.txt"
+        resp = requests.get(nasdaq_url, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            df_nasdaq = pd.read_csv(io.StringIO(resp.text), sep='|')
+            # Filter out test issues
+            df_nasdaq = df_nasdaq[df_nasdaq['Test Issue'] == 'N']
+            nasdaq_symbols = df_nasdaq['Symbol'].dropna().tolist()
+            tickers.update(nasdaq_symbols)
+            print(f"Loaded exchange-traded universe from NASDAQ directory.")
+    except Exception as e:
+        print(f"NASDAQ directory fetch notice: {e}")
+
+    # Apply strict cleaning & deduplication
+    valid_tickers = clean_and_filter_tickers(list(tickers))
+    print(f"Combined master universe contains {len(valid_tickers)} clean equities & ADRs.")
+    return valid_tickers
 
 def process_batch(ticker_batch):
-    """Fetches data and screens for Extended Mid-Caps and ADRs ($1B - $25B)."""
+    """Fetches market metrics and screens for Extended Mid-Caps & ADRs ($1B - $25B)."""
     records = []
     tickers_str = " ".join(ticker_batch)
     
@@ -75,7 +93,7 @@ def process_batch(ticker_batch):
                 if not (1e9 <= market_cap <= 25e9):
                     continue
                 
-                # Fetch 1-year history
+                # Retrieve 1-year historical price data
                 hist = stock_obj.history(period="1y")
                 if hist.empty or len(hist) < 90:
                     continue
@@ -99,7 +117,7 @@ def process_batch(ticker_batch):
                 ma_150 = hist['Close'].tail(150).mean() if len(hist) >= 150 else price
                 higher_150d = "YES" if price > ma_150 else "NO"
                 
-                # Breakout Composite Score (0 to 3)
+                # Composite Breakout Score (0 to 3)
                 score = (1 if near_breakout == "YES" else 0) + \
                         (1 if vol_spike == "YES" else 0) + \
                         (1 if higher_150d == "YES" else 0)
@@ -131,7 +149,7 @@ def process_batch(ticker_batch):
             except Exception:
                 continue
     except Exception as e:
-        print(f"Batch processing error: {e}")
+        print(f"Batch execution error: {e}")
         
     return records
 
@@ -140,7 +158,7 @@ def main():
     batch_size = 50
     all_midcap_records = []
     
-    print(f"Scanning market universe across {len(all_tickers)} tickers for Extended Mid-Caps & ADRs ($1B-$25B)...")
+    print(f"Scanning master market universe across {len(all_tickers)} tickers for Extended Mid-Caps & ADRs ($1B-$25B)...")
     
     for i in range(0, len(all_tickers), batch_size):
         batch = all_tickers[i:i + batch_size]
@@ -148,14 +166,14 @@ def main():
         all_midcap_records.extend(records)
         
         if (i // batch_size + 1) % 10 == 0 or (i + batch_size) >= len(all_tickers):
-            print(f"Scanned {min(i + batch_size, len(all_tickers))}/{len(all_tickers)} tickers | Verified Mid-Caps/ADRs: {len(all_midcap_records)}")
+            print(f"Scanned {min(i + batch_size, len(all_tickers))}/{len(all_tickers)} tickers | Identified Mid-Caps & ADRs: {len(all_midcap_records)}")
         
         time.sleep(0.5)
         
     df = pd.DataFrame(all_midcap_records)
     if not df.empty:
         df.to_parquet("latest_stocks.parquet")
-        print(f"\n✅ EXTENDED SCAN COMPLETE: {len(df)} verified mid-cap & ADR stocks ($1B-$25B) saved to latest_stocks.parquet.")
+        print(f"\n✅ FULL SCAN COMPLETE: {len(df)} verified mid-caps & ADRs ($1B-$25B) saved to latest_stocks.parquet.")
     else:
         print("❌ Error: No valid mid-cap records found.")
 
