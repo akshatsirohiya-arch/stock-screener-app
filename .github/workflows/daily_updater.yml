@@ -1,0 +1,33 @@
+name: Daily Stock Data Update Cloud Agent
+
+on:
+  schedule:
+    # Runs Monday through Friday at 21:00 UTC (after market close)
+    - cron: '0 21 * * 1-5'
+  workflow_dispatch: # Allows manual trigger from GitHub web interface anytime
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: pip install pandas yfinance pyarrow
+
+      - name: Fetch Latest Market Data
+        run: python fetch_data.py
+
+      - name: Commit and Push Updated Dataset
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add latest_stocks.parquet
+          git commit -m "Auto-update daily stock metrics" || exit 0
+          git push
